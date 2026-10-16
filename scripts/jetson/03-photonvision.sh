@@ -21,16 +21,6 @@ wget -q -O "$tmp/install.sh" "$INSTALLER_URL"
 # Use the long --version= form; the installer's short -v does not take an argument reliably.
 sudo bash "$tmp/install.sh" --version="$PV_VERSION" --no-networking
 
-# Select Java 17 even if another runtime is the system default. The fork installer
-# replaces this same drop-in when it installs the customized jar.
-sudo mkdir -p /etc/systemd/system/photonvision.service.d
-sudo tee /etc/systemd/system/photonvision.service.d/java17.conf >/dev/null <<'EOF'
-[Service]
-ExecStart=
-ExecStart=/usr/lib/jvm/java-17-openjdk-arm64/bin/java -Xmx512m -XX:-CreateCoredumpOnCrash -jar /opt/photonvision/photonvision.jar -n
-EOF
-sudo systemctl daemon-reload
-
 sudo systemctl restart photonvision
 sleep 5
 systemctl --no-pager --lines=0 status photonvision || true

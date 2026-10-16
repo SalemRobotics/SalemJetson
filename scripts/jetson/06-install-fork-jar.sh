@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Swap the 4143 CUDA PhotonVision fork jar into the photonvision.service created by
-# 03-photonvision.sh, and run it explicitly on Java 17, matching the 2026 build.
+# 03-photonvision.sh, and run it on Java 17 (the fork targets 17; the 2027 installer
+# made Java 25 the system default).
 # Run ON THE JETSON. Usage: 06-install-fork-jar.sh <path/to/photonvision-...-linuxarm64.jar>
 set -euo pipefail
 # Writes on the read-only system (ro-root on) land in RAM and vanish at the next boot.
