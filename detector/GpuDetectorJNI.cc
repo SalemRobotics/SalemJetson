@@ -38,6 +38,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -142,6 +143,8 @@ bool GpuLockOn() {
   return on;
 }
 std::mutex gpu_mu;
+// The far search's off switch after a failure (processimage): microseconds on the steady clock.
+std::atomic<int64_t> far_search_off_until_us{0};
 
 // CUDA stream capture (bos-05's first-stage graph) breaks CUDA calls on other threads that aren't
 // allowed while any stream is capturing: work on the legacy default stream, cudaFree, EGL buffer
@@ -243,6 +246,9 @@ struct DetectorSlot {
   frc::apriltag::CameraMatrix camera_matrix = DefaultCameraMatrix();
   frc::apriltag::DistCoeffs dist_coeffs = DefaultDistCoeffs();
   long gpu_input_frames = 0;  // for the GPU input check
+  // bos-09: the most candidate quads seen in one frame, logged at each doubling from 512, to see
+  // how close real scenes get to the detector's limit (GpuDetector::kMaxBlobs).
+  size_t quads_logged = 256;
   // When the first-stage graph (bos-05) was last recorded: at most once a second, so a buffer
   // or mask that keeps changing can't stall every camera on each frame.
   std::chrono::steady_clock::time_point last_graph_record{};
@@ -309,6 +315,9 @@ void ApplyMaskToDetector(DetectorSlot &s, int width, int height) {
     const int y0 = std::clamp(static_cast<int>(std::floor(b[1] * dh)), 0, dh);
     const int x1 = std::clamp(static_cast<int>(std::ceil((b[0] + b[2]) * dw)), 0, dw);
     const int y1 = std::clamp(static_cast<int>(std::ceil((b[1] + b[3]) * dh)), 0, dh);
+    // A box with no area, or a negative width or height (hand-edited or imported settings), is
+    // skipped: std::fill with x1 < x0 would run past the end of the buffer.
+    if (x1 <= x0 || y1 <= y0) continue;
     for (int y = y0; y < y1; ++y) {
       std::fill(s.mask_pixels.begin() + static_cast<size_t>(y) * dw + x0,
                 s.mask_pixels.begin() + static_cast<size_t>(y) * dw + x1, include ? 1 : 0);
@@ -479,18 +488,20 @@ void RecordStats(Stats &st, jlong handle, const cv::Mat &img, const zarray_t *de
   }
   double window = std::chrono::duration<double>(t2 - st.start).count();
   if (window >= 1.0) {
-    std::cout << "971 stats h" << handle << " " << img.cols << "x" << img.rows << ": "
-              << st.frames / window << " calls/s, detect avg " << st.detect_ms / st.frames
-              << " ms max " << st.max_ms << " ms, jni " << st.jni_ms / st.frames
-              << " ms, tags/frame " << double(st.tags) / st.frames;
-    if (st.tags) {
-      std::cout << ", margin avg " << st.margin / st.tags << " min " << st.min_margin;
-    }
-    if (st.errors) std::cout << ", errors " << st.errors;
-    if (st.lock_wait_ms > 0) std::cout << ", gpu lock wait " << st.lock_wait_ms / st.frames << " ms";
-    if (st.gpu_input) std::cout << ", gpu input " << 100 * st.gpu_input / st.frames << "%";
-    if (st.ages) std::cout << ", frame age at result " << st.age_ms / st.ages << " ms";
-    std::cout << " [bos]" << std::endl;
+    // Built whole, then written in one go: written piece by piece, two cameras' lines could
+    // interleave mid-line, and health-check.sh and the tests parse them.
+    std::ostringstream line;
+    line << "971 stats h" << handle << " " << img.cols << "x" << img.rows << ": "
+         << st.frames / window << " calls/s, detect avg " << st.detect_ms / st.frames << " ms max "
+         << st.max_ms << " ms, jni " << st.jni_ms / st.frames << " ms, tags/frame "
+         << double(st.tags) / st.frames;
+    if (st.tags) line << ", margin avg " << st.margin / st.tags << " min " << st.min_margin;
+    if (st.errors) line << ", errors " << st.errors;
+    if (st.lock_wait_ms > 0) line << ", gpu lock wait " << st.lock_wait_ms / st.frames << " ms";
+    if (st.gpu_input) line << ", gpu input " << 100 * st.gpu_input / st.frames << "%";
+    if (st.ages) line << ", frame age at result " << st.age_ms / st.ages << " ms";
+    line << " [bos]\n";
+    std::cout << line.str() << std::flush;
     st = Stats{};
   }
 }
@@ -1256,6 +1267,19 @@ JNIEXPORT jobjectArray JNICALL Java_org_photonvision_jni_GpuDetectorJNI_processi
     }
     return nullptr;
   }
+  if (img.cols > 2048 || img.rows > 2048) {
+    // The 971 detector keeps boundary points' x and y in 10 bits of the half-size image
+    // (QuadBoundaryPoint), so past 2048 px they wrap round: wrong detections, and on a busy frame
+    // a GPU memory fault that takes every camera down. Refuse such frames instead.
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      std::cout << "processimage: " << img.cols << "x" << img.rows
+                << " is over the detector's 2048 px limit; skipping (use a smaller video mode)"
+                << std::endl;
+    }
+    return nullptr;
+  }
 
   DetectorSlot *s = Slot(handle);
   if (!s) {
@@ -1310,12 +1334,6 @@ JNIEXPORT jobjectArray JNICALL Java_org_photonvision_jni_GpuDetectorJNI_processi
       SpectrumInjectStickyCudaFault();
     }
   }
-  std::unique_lock<std::mutex> gpu_lock(gpu_mu, std::defer_lock);
-  if (GpuLockOn()) {
-    gpu_lock.lock();
-    s->stats.lock_wait_ms +=
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  }
   // GPU input (GpuInputOn): the frame is already on the GPU when this is the buffer just decoded.
   NvjpgThread &nt = nvjpg_thread;
   const uint8_t *image_device = nullptr;
@@ -1342,62 +1360,115 @@ JNIEXPORT jobjectArray JNICALL Java_org_photonvision_jni_GpuDetectorJNI_processi
   }
   nt.dev_valid = false;  // one frame, one use
 
-  if (s->mask_dirty) {
-    ApplyMaskToDetector(*s, img.cols, img.rows);
-    std::cout << "971 detector h" << handle << ": mask "
-              << (s->mask_mode == 0 ? "off" : s->mask_mode == 1 ? "ignoring" : "searching only")
-              << (s->mask_mode ? " " + std::to_string(s->mask_rects.size() / 4) + " box(es)" : "")
-              << std::endl;
-  }
-
-  // bos-05: record the first-stage graph (once per detector and input buffer) while no other
-  // thread uses CUDA (see CudaCaptureLock).
-  // Meanwhile (a new mask, say) Detect() runs the steps one by one.
-  const auto now_graph = std::chrono::steady_clock::now();
-  if (s->gpu && now_graph - s->last_graph_record >= std::chrono::seconds(1) &&
-      s->gpu->FirstStageGraphWanted(image_device)) {
-    s->last_graph_record = now_graph;
-    cuda.unlock();
-    {
-      std::lock_guard<CudaCaptureLock> exclusive(cuda_capture_lock);
-      absl::Status status = s->gpu->RecordFirstStageGraph(image_device);
-      std::cout << "971 detector h" << handle << ": first-stage graph "
-                << (status.ok() ? "recorded" : std::string(status.message())) << std::endl;
-    }
-    cuda.lock();
-  }
+  // Everything from here to the far search can throw: with bos-01, CHECK_CUDA throws instead of
+  // aborting. An exception that left this function would reach the JVM and std::terminate it,
+  // taking every camera down, so one try covers the mask upload, the graph recording, Detect() and
+  // the far search: a failure skips this frame and rebuilds this camera's detector (RecordFailure).
+  std::unique_lock<std::mutex> gpu_lock(gpu_mu, std::defer_lock);
+  std::vector<far_search::Det> far;
+  auto t1 = t0;  // end of Detect(): "detect" time excludes the far search
+  bool in_far_search = false;
   try {
+    if (s->mask_dirty) {
+      ApplyMaskToDetector(*s, img.cols, img.rows);
+      std::cout << "971 detector h" << handle << ": mask "
+                << (s->mask_mode == 0 ? "off" : s->mask_mode == 1 ? "ignoring" : "searching only")
+                << (s->mask_mode ? " " + std::to_string(s->mask_rects.size() / 4) + " box(es)" : "")
+                << std::endl;
+    }
+
+    // bos-05: record the first-stage graph (once per detector and input buffer) while no other
+    // thread uses CUDA (see CudaCaptureLock). Meanwhile (a new mask, say) Detect() runs the steps
+    // one by one. If recording throws, the stream may be left capturing: the rebuild that
+    // RecordFailure asks for destroys it with the detector.
+    const auto now_graph = std::chrono::steady_clock::now();
+    if (s->gpu && now_graph - s->last_graph_record >= std::chrono::seconds(1) &&
+        s->gpu->FirstStageGraphWanted(image_device)) {
+      s->last_graph_record = now_graph;
+      cuda.unlock();
+      {
+        std::lock_guard<CudaCaptureLock> exclusive(cuda_capture_lock);
+        absl::Status status = s->gpu->RecordFirstStageGraph(image_device);
+        std::cout << "971 detector h" << handle << ": first-stage graph "
+                  << (status.ok() ? "recorded" : std::string(status.message())) << std::endl;
+      }
+      cuda.lock();
+    }
+    // The optional GPU lock (GpuLockOn) is taken only now, after the graph recording: held across
+    // it, this camera would wait for the exclusive capture lock while another camera held the
+    // shared lock waiting for gpu_mu, and every camera would freeze.
+    if (GpuLockOn()) {
+      const auto w0 = std::chrono::steady_clock::now();
+      gpu_lock.lock();
+      s->stats.lock_wait_ms +=
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    }
     absl::Status status = s->gpu->Detect(img.ptr<uint8_t>(), image_device);
     if (status.ok()) {
       detections = s->gpu->Detections();
       s->consecutive_failures = 0;
+      if (const size_t q = s->gpu->LastNumCandidateQuads(); q >= 2 * s->quads_logged) {
+        while (q >= 2 * s->quads_logged) s->quads_logged *= 2;
+        std::cout << "971 detector h" << handle << ": up to " << q
+                  << " candidate quads in a frame (limit "
+                  << frc::apriltag::GpuDetector::kMaxBlobs << ")" << std::endl;
+      }
+    } else if (absl::IsResourceExhausted(status)) {
+      // bos-09: too busy a scene for the detector's buffers. The frame is skipped; nothing is
+      // broken, so no rebuild (RecordFailure would rebuild the detector on every such frame).
+      failed = true;
+      static std::atomic<int64_t> last_log_s{0};
+      const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+      if (last_log_s.exchange(now_s) != now_s) {
+        std::cout << "971 detector h" << handle << ": " << status.message() << std::endl;
+      }
     } else {
       failed = true;
       RecordFailure(*s, handle, std::string(status.message()).c_str());
     }
+    if (gpu_lock.owns_lock()) gpu_lock.unlock();
+    t1 = std::chrono::steady_clock::now();
+
+    // SpectrumJetson: the far-tag search (far_search.h): only while no camera has a good view.
+    // Its time is kept out of "detect" (the far search keeps its own totals).
+    const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    if (!failed && detections && now_us >= far_search_off_until_us.load()) {
+      in_far_search = true;
+      far = far_search::Process(static_cast<int>(handle), img, far_search::Copy(detections), s->td,
+                                s->camera_matrix, s->dist_coeffs, now_us);
+      far.erase(std::remove_if(far.begin(), far.end(),
+                               [&](const far_search::Det &d) {
+                                 return !MaskKeeps(*s, img.cols, img.rows, d.c[0], d.c[1]);
+                               }),
+                far.end());
+      ReportFarSearch();
+      in_far_search = false;
+    }
   } catch (const std::exception &e) {
-    failed = true;
     cudaGetLastError();  // clear a non-sticky error so the rebuild can succeed
-    RecordFailure(*s, handle, e.what());
+    if (!cuda.owns_lock()) cuda.lock();
+    if (in_far_search) {
+      // The far search failed after Detect() succeeded: this frame's normal detections stand (the
+      // detector's own buffer). Only the far search goes off, for 10 s, so a far detector that
+      // keeps failing costs no camera its own detector (which a RecordFailure would rebuild).
+      far.clear();
+      far_search_off_until_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count() +
+                                10'000'000;
+      std::cout << "971 far search failed (" << e.what() << "); off for 10 s" << std::endl;
+    } else {
+      failed = true;
+      detections = nullptr;
+      RecordFailure(*s, handle, e.what());
+    }
+    if (t1 == t0) t1 = std::chrono::steady_clock::now();
   }
   if (gpu_lock.owns_lock()) gpu_lock.unlock();
-  auto t1 = std::chrono::steady_clock::now();
-
-  // SpectrumJetson: the far-tag search (far_search.h): only while no camera has a good view. Its
-  // time is kept out of "detect" (the far search keeps its own totals).
-  std::vector<far_search::Det> far;
-  if (!failed && detections) {
-    const int64_t now_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(t1.time_since_epoch()).count();
-    far = far_search::Process(static_cast<int>(handle), img, far_search::Copy(detections), s->td,
-                              s->camera_matrix, s->dist_coeffs, now_us);
-    far.erase(std::remove_if(far.begin(), far.end(),
-                             [&](const far_search::Det &d) {
-                               return !MaskKeeps(*s, img.cols, img.rows, d.c[0], d.c[1]);
-                             }),
-              far.end());
-    ReportFarSearch();
-  }
   jobjectArray result;
   if (far.empty()) {
     result = MakeJObjectArray(env, detections);
@@ -1427,6 +1498,19 @@ JNIEXPORT void JNICALL Java_org_photonvision_jni_GpuDetectorJNI_setFarSearch(JNI
                                                                             jboolean enabled,
                                                                             jdouble sweeps_per_s) {
   far_search::SetConfig({enabled == JNI_TRUE, sweeps_per_s});
+}
+
+// SpectrumJetson (photonvision-69): GpuDetectorJNI.setFarSearchExcluded(int[] ids), PhotonVision's
+// excluded tags (ExcludedTags), which don't count toward the far search's good view.
+JNIEXPORT void JNICALL Java_org_photonvision_jni_GpuDetectorJNI_setFarSearchExcluded(JNIEnv *env,
+                                                                                    jclass,
+                                                                                    jintArray ids) {
+  std::vector<int> v;
+  if (ids) {
+    v.resize(static_cast<size_t>(env->GetArrayLength(ids)));
+    if (!v.empty()) env->GetIntArrayRegion(ids, 0, static_cast<jsize>(v.size()), v.data());
+  }
+  far_search::SetExcluded(v);
 }
 
 // double[] farSearchStatus(): {enabled, starved now, full-size searches, crops, far tags returned,

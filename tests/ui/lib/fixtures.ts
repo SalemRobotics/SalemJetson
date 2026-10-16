@@ -1,4 +1,5 @@
 import { test as base, expect, type APIRequestContext, type Browser, type Page } from "@playwright/test";
+import { cameraInventory } from "./cameras";
 import { cameraState, Dashboard, TEST_PIPELINE, uiState, type CameraState } from "./pv";
 
 // Every test runs on a temporary copy of the camera's current pipeline, called zz-uitest, and
@@ -12,7 +13,11 @@ export async function pickCamera(request: APIRequestContext): Promise<string> {
     if (!cameras.some((c) => c.nickname === wanted)) throw new Error(`PV_UI_CAMERA=${wanted}: no such camera`);
     return wanted;
   }
-  return (cameras.find((c) => c.nickname === "TopLeft") ?? cameras[0]).nickname;
+  // Only a camera that's streaming (global-setup measured it).
+  const { streaming } = cameraInventory();
+  const live = cameras.filter((c) => streaming.includes(c.nickname));
+  if (!live.length) throw new Error("No streaming camera to test on");
+  return (live.find((c) => c.nickname === "TopLeft") ?? live[0]).nickname;
 }
 
 export async function deletePipeline(dash: Dashboard, request: APIRequestContext, camera: string, name: string) {
@@ -136,8 +141,9 @@ export const test = base.extend<{ dash: Dashboard; camera: string; pipeline: Tes
     try {
       await use(pipeline);
     } finally {
-      // Back to the dashboard in a known state before cleaning up.
-      await dash.page.keyboard.press("Escape");
+      // A fresh page before cleaning up: a test that failed or timed out half way can leave a menu
+      // or dialog open, and then the delete's own clicks time out (zz-uitest left behind).
+      await dash.open();
       await removeTestPipeline(dash, request, pipeline);
     }
   }

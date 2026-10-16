@@ -1,4 +1,5 @@
 import { test, expect, removeEverywhere, restoreRunning } from "../lib/fixtures";
+import { notAllStreaming } from "../lib/cameras";
 import { cameraState, changeControl, uiState, type CameraState, type Dashboard } from "../lib/pv";
 import type { APIRequestContext } from "@playwright/test";
 
@@ -67,6 +68,7 @@ test("Create on every camera from another camera's pipeline, then Switch all", a
   camera,
   pipeline
 }) => {
+  test.skip(!!notAllStreaming(), notAllStreaming());
   await removeEverywhere(dash, request, [ALL], camera);
   await dash.selectPipeline("zz-uitest");
   // A distinctive source: decision margin 23, and an orientation the other cameras mustn't take.
@@ -105,8 +107,17 @@ test("Create on every camera from another camera's pipeline, then Switch all", a
         } else {
           expect(c.currentPipelineIndex, `${c.nickname} stays on its pipeline`).toBe(running.get(c.nickname));
           expect(copy.decisionMargin, `${c.nickname} got the copied settings`).toBe(23);
-          // Orientation belongs to the camera: the others keep theirs, not the source's 90° CW.
-          expect(copy.inputImageRotationMode, `${c.nickname} keeps its own orientation`).not.toEqual(
+          // Orientation belongs to the camera: the others keep theirs, not the source's 90° CW,
+          // and not the new pipeline's default either (photonvision-63: it used to come out at the
+          // default, which this missed while every camera ran the default orientation).
+          // From the same pipeline list as `copy` (the running pipeline's own entry): uiState gives
+          // currentPipelineSettings' orientation as a number, the list's as the enum name.
+          const b = before.find((x) => x.nickname === c.nickname)!;
+          const own = settingsOf(b, b.pipelineNicknames[b.currentPipelineIndex]);
+          expect(copy.inputImageRotationMode, `${c.nickname} keeps its own orientation`).toEqual(
+            own.inputImageRotationMode
+          );
+          expect(copy.inputImageRotationMode, `${c.nickname} doesn't take the source's`).not.toEqual(
             source.inputImageRotationMode
           );
         }
@@ -142,9 +153,12 @@ test("the Pipeline dropdown numbers pipelines as PhotonVision does", async ({ da
   const state = await cameraState(request, camera);
   const select = dash.control("select", "Pipeline");
   await select.locator(".v-field").click();
-  const options = (await dash.page.locator(".v-overlay--active .v-list-item").allInnerTexts()).map((t) => t.trim());
+  // A retrying check: the menu's items are there before their text is (read at once, they were
+  // all "" on a slow link).
+  await expect(dash.page.locator(".v-overlay--active .v-list-item")).toHaveText(
+    state.pipelineNicknames.map((name, index) => `${index}: ${name}`)
+  );
   await dash.page.keyboard.press("Escape");
-  expect(options).toEqual(state.pipelineNicknames.map((name, index) => `${index}: ${name}`));
   expect(await dash.currentPipeline()).toEqual({ index: state.currentPipelineIndex, name: "zz-uitest" });
   void pipeline;
 });

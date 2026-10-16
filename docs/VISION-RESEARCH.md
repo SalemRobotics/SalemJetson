@@ -359,6 +359,27 @@ The newest code is [RobotCode2026Public/northstar](https://github.com/Mechanical
     spots.
   - **High / high:** it costs nothing.
 
+**Game pieces and opponent robots (checked 2026-09-28,** [`ObjectDetector.py`](https://github.com/Mechanical-Advantage/RobotCode2026Public/blob/main/northstar/pipeline/ObjectDetector.py),
+[`ObjectDetection.java`](https://github.com/Mechanical-Advantage/RobotCode2026Public/blob/main/src/main/java/org/littletonrobotics/frc2026/ObjectDetection.java)**).**
+Same split for both: the coprocessor sends box corners, the robot turns them into field positions.
+- **Coprocessor:** a separate worker runs YOLO (CoreML on the Mac mini) on the tiled frames above.
+  - **Opponent robots** come from a second model on the full frame, marked temporary in the code.
+  - Output is each box's four corner angles (tx/ty, undistorted) plus the timestamp. No distance.
+- **Robot ranging:** the bottom edge of the box is projected onto the floor using camera height
+  and pitch, with the robot pose and camera transform looked up at the frame's timestamp.
+  - Fuel: bottom-middle plus half a ball diameter. Robots: bottom-middle plus the drivebase radius.
+  - Frames are skipped when roll or pitch is over 5°. Points outside the field or above the
+    horizon are dropped.
+- **Maps, not tracks:** no velocity or IDs.
+  - **Fuel:** a spatial hash grid. A new sighting replaces any within half a ball diameter, and
+    fuel expires after 3 s. Fuel inside the robot's footprint, or inside a camera's view but not
+    detected, is cleared.
+  - **Opponents:** a new sighting replaces any within 35 in, and each expires after 2 s.
+  - The fuel map feeds their auto commands and path planner.
+- **For us: Med / med.** We already detect game pieces on the Jetson. The robot-side ranging
+  and expiring maps need only PhotonLib's corners and cost no Jetson time. An opponent model
+  costs another inference pass.
+
 **Robot-code practices** (for the robot-code agent, issue #10): std devs of 0.01·d²/n² (xy) and
 0.03·d²/n² (θ), with single-tag θ ignored. The rest:
 - **Single-tag disambiguation:** keep a frame only when one reprojection error is under 0.4x the
@@ -399,7 +420,9 @@ What an ideal system has that ours doesn't yet, roughly in order of value for ef
 3. **Cameras that heal themselves.** Detect a stuck or corrupt camera and reset its USB port
    automatically, instead of warning. **Done** (`photonvision-29`).
 4. **Quality metadata on every tag,** so the robot can weigh each one: distance from the image
-   edge, how far undistortion moved the corners, reprojection error, decision margin.
+   edge, how far undistortion moved the corners, reprojection error, decision margin. **Done**
+   (`photonvision-61`): `/photonvision/<camera>/tagQuality`, matched to results by sequence ID
+   (README, "How much to trust each tag").
    - Tags near the edge are trusted less, on a tunable curve (robot side).
    - The robot chooses which tags to trust.
 5. **Health in the robot log:** temperatures, fps, failed decodes, USB resets and free disk, as

@@ -2,6 +2,7 @@ import { test, expect } from "@playwright/test";
 import { FakeRobot, JETSON, robotState } from "../lib/fake-robot";
 import { cameraState, Dashboard, uiState } from "../lib/pv";
 import { pickCamera, removeEverywhere, restoreRunning } from "../lib/fixtures";
+import { notAllStreaming } from "../lib/cameras";
 
 // photonvision-51: "Event pipeline when the field connects". A profile (zz-uitest-all on every
 // camera) is the event pipeline; the fake robot connects disabled, then the FMS attaches: every
@@ -12,6 +13,7 @@ const ALL = "zz-uitest-all";
 
 test("event pipeline when the field connects; overrides stick; Switch now", async ({ page, request }) => {
   test.skip(!JETSON, "needs PV_UI_JETSON (tests/ui/run.sh sets it) to start the fake robot");
+  test.skip(!!notAllStreaming(), notAllStreaming());
   const saved = await robotState(request);
   test.skip(saved.robotConnected, "a robot is already connected");
   const home = await pickCamera(request);
@@ -94,7 +96,13 @@ test("event pipeline when the field connects; overrides stick; Switch now", asyn
       await expect(card.getByTestId("last-event-switch")).toContainText("Switch now");
     });
   } finally {
-    await robot?.stop();
+    // A failing stop() must not skip the rest: left on, "switch to the event pipeline on FMS"
+    // would switch every camera's pipeline when the real field connects.
+    try {
+      await robot?.stop();
+    } catch (e) {
+      console.warn("fake robot stop failed (the restores below still run):", e);
+    }
     // The fake field also triggers the day's "field connected" snapshot (photonvision-53): delete
     // it, so a real one is still taken when the real field connects.
     const snaps = (await (await request.get("/api/snapshots")).json()) as { id: string; reason: string; createdAt: number }[];

@@ -57,7 +57,11 @@ def detect_session(session_dir: Path, every: int, min_margin: float, cache: Path
     """Tag corners in every ``every``-th frame of every camera: WPILib's detector on all CPU cores
     ("cpu"), or the 971 GPU detector on the Jetson ("971"). Cached in ``cache`` (redone if the
     settings change)."""
-    key = {"every": every, "minMargin": min_margin, "detector": detector}
+    key = {"every": every, "minMargin": min_margin, "detector": detector,
+           # Which recording: without it, a cache left in the same output folder by another
+           # session's solve was reused (audit 2026-10-01). Path plus the frame indexes' sizes.
+           "session": str(Path(session_dir).resolve()),
+           "frames": sum(p.stat().st_size for p in sorted(Path(session_dir).glob("*/*.csv")))}
     if detector == "cpu":
         key.pop("detector")  # caches from before the 971 option
     if cache and cache.exists():
@@ -180,6 +184,11 @@ def cmd_solve(a) -> int:
         k, x, y, yaw = _parse_anchor(a.anchor_camera)
         T_robot_rig = solver.anchor_camera(res, k, x, y, yaw)
         note = f"Anchored by {k}'s x, y and yaw from CAD ({x}, {y}, {yaw}°)."
+    if not res.converged:
+        # The numbers are wherever the solver stopped: usually close, but not checked.
+        warnings.append("The solver stopped at its evaluation limit before it converged: the tag positions and "
+                        "mounts may be off. Check each camera's fit (px RMS) below; record again with longer still spots.")
+        print(f"WARNING: {warnings[-1]}", file=sys.stderr)
     report.write(res, layout_json, layout, out, T_robot_rig, note, notes=warnings, cams=cams, cad=cad)
     print(f"Wrote {out}/report.md, corrected-layout.json, mounts.json", file=sys.stderr)
     return 0

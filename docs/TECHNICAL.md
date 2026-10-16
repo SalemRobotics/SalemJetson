@@ -339,7 +339,7 @@ The robot is switched off, never shut down, so every power-off is a power cut.
 - **System log.** It was RAM-only (`/var/log/journal` didn't exist), so every cut erased it, including the log of a brownout. Now `Storage=persistent`, `SyncIntervalSec=5s`, `SystemMaxUse=300M`.
 - **Rewind.** The video file, then the index, are forced to the SSD every 2 s and on close; `session.json` is synced too. Cost: ~0.7% of the recording's frames come late (5 of 704) when a sync blocks the recorder thread. Detector fps is unchanged.
 - **Test.** `tests/power-cut/run.sh` (laptop): records, you pull the plug, then after boot it checks the ext4 errors and journal replay, the log from before the cut, PhotonVision's health, and the seconds of video lost.
-- **Clock.** No RTC battery on the devkit: after a cut the clock restarts at **1970** until NTP (Wi-Fi) corrects it. That confuses `journalctl -b -1` (use `_BOOT_ID=`), and Rewind names made before NTP carry a 1970 date; their leading number is what orders them.
+- **Clock.** No RTC battery on the devkit: after a cut the clock restarts at **1970** until NTP (Wi-Fi) corrects it. That confuses `journalctl -b -1` (use `_BOOT_ID=`), and Rewind names made before NTP carry a 1970 date; their leading number is what orders them. That number comes from a counter file on the scratch partition; since `photonvision-65` it's never below the newest recording on disk, so a counter lost to a cut can't restart the numbering (the quota deletes the lowest numbers first, so it would have deleted the newest recordings).
 - **Result (2026-09-24, power pulled 21.4 s into a bench recording):** 0 ext4 errors; the kernel logged `1 orphan inode deleted` / `recovery complete` (the journal replayed, normal after a cut). The old boot's log survived up to 3 s before the cut, including PhotonVision's lines. PhotonVision came back healthy (90 / 105 fps, both calibrations with 8 coefficients). The recording kept 20.0 s of 21.4 s: **1.4 s lost**, every saved frame a complete JPEG. `session.json` has no end, as expected.
 
 ### Jetson clock from the robot (2026-09-24)
@@ -352,6 +352,7 @@ The robot is switched off, never shut down, so every power-off is a power cut.
 - **Bench test (fake robot 120 s fast, before the NTP rule):** `Clock set from the robot: was 04:57:20, now 04:59:20 (+120.0 s)`, with that log line itself stamped 04:59:20, so the clock really moved. timesyncd then restored NTP time.
 - **Next boot.** It then touches `/var/lib/systemd/timesync/clock`; timesyncd moves the clock up to that file's modification time at boot, so after a power cut the Jetson starts near the last robot time, not 1970.
 - **Not for vision.** Frame timestamps, the PhotonVision↔robot time sync and Rewind frame times use `nt::Now` (monotonic), which setting the date doesn't move. It fixes Rewind names, the system log, and file dates.
+- **Nor for timers** (`photonvision-65`, 2026-10-01). At an event the jump happens at every boot: the Jetson starts on the date it last saved, so it's behind by however long it was off. Quiet mode timed "disabled for 60 s" on the date, so the jump started it about a second after the robot connected. A jump back (a Driver Station laptop whose clock is behind) delayed it, and its retries, by the size of the jump, and froze any camera with a frame-rate limit (every Object Detection pipeline has one, and robot code can set one) for as long. Every interval PhotonVision measures now uses `System.nanoTime`: quiet mode, idle mode's checks, the frame-rate limit, settings saves, the health-check cache, the dashboard's 10 Hz updates, CPU and network rates. `tests/quiet-mode/clock-jump.sh` (a fake robot whose clock is 1 h ahead): before, quiet at +1.0 s, the date having jumped at +1.0 s; after, quiet at +60.2 s.
 - **Robot half:** [2026-FM-SystemCore#10](https://github.com/Spectrum3847/2026-FM-SystemCore/issues/10), section 6.
 - **Test:** `tests/robot-clock/run.sh` (a fake robot NT server on the Jetson).
 
@@ -1081,7 +1082,11 @@ and the GPU sat at 40–45%, against 0.8 cores and 17% on 2026-09-26 (two camera
   `/tmp/spectrum-971-gpu-lock`, re-read every 2 s; **off by default**): one camera's `Detect()` at a
   time, so the cameras queue once per frame instead of on every CUDA call. With `bos-03` it saves
   another ~0.15 cores and costs no latency; before `bos-03` it saved 0.3 cores but added 0.3 ms.
-  The stats line shows `gpu lock wait` when it's on.
+  The stats line shows `gpu lock wait` when it's on. **Measured before `bos-05`:** with the
+  first-stage graph, holding this lock across the graph recording could deadlock every camera
+  (this camera waiting for the exclusive capture lock, another holding the shared lock while
+  waiting for this one). Since the 2026-10-01 audit it's taken only after the recording; it's
+  still off by default, and health-check warns when `/tmp/spectrum-971-gpu-lock` is set.
 - **The GPU load is real work.** `nsys profile --trace=cuda` (8 s, 3,866 frames, with `bos-03`):
   0.65 ms of kernels and 0.13 ms of copies and memsets per frame, 31.6 kernel launches and ~58 CUDA
   calls in all. 0.78 ms × 483 fps ≈ 37%, what GR3D shows. Two kernels are 42% of it, and both work
@@ -1486,8 +1491,10 @@ when the robot is short of a good pose:
   cameras don't have yet). No good view on any camera for 250 ms = *starved*: then one camera at a
   time (round robin: the active camera whose last full-size search is oldest), at most
   `farSweepsPerSecond` (30) across all, runs a **full-size search**: its frame upscaled 2x
-  (nearest neighbour, plain C++), through one shared 2560x1600 971 detector, so the half-size
-  search sees every pixel. Tags it finds that the normal search didn't are **tracked** with
+  (nearest neighbour, plain C++), through one shared 971 detector, so the half-size search sees
+  every pixel. It goes in tiles: the 971 detector keeps point coordinates in 10 bits of the
+  half-size image, so its input is at most 2048 px a side, and a 1280x800 frame is searched as
+  two 672x800 tiles (1344x1600 upscaled) that overlap by 64 px. Tags it finds that the normal search didn't are **tracked** with
   160x160 crops upscaled to 320x320 (a detector per camera), one crop per camera frame, until
   they're 24 px or more in the normal search's results or unseen for 300 ms. The moment any
   camera has a good view, no searches or crops, and the tracks are dropped.
@@ -1694,8 +1701,20 @@ when the robot is short of a good pose:
   | disabled | 31 | 7.8 W |
 
   "Robot disabled: garbage collected in 27 ms, heap 24 -> 11 MB" 0.5 s after the second disable.
-- **Not yet checked on 2027 robot code:** that 2027 WPILib still publishes `/FMSInfo/FMSControlData`
-  to coprocessors. If it doesn't, idle mode never engages (it fails safe: full rate).
+- **WPILib 2027 doesn't publish `/FMSInfo/FMSControlData`** (found in the 2026-10-01 audit, checked
+  in alpha-6's `DriverStationBackend.MatchDataSender`). It publishes `/FMSInfo/ControlWord`, a
+  `struct:ControlWord`: one little-endian uint64 with the robot mode in bits 56-57 (1 auto,
+  2 teleop, 3 utility), enabled 58, e-stop 59, FMS attached 60, DS attached 61. Before
+  `photonvision-62`, PhotonVision never saw an enable from a 2027 robot. The all-false default
+  meant "connected and disabled", so every camera ran at the idle rate (~30 fps) through auto and
+  teleop, and quiet mode started 60 s after connecting. This was not the "fail safe" the old note
+  claimed. `photonvision-62` reads both formats (2026 roboRIO and 2027 SystemCore), and treats a
+  robot whose control word never arrived as enabled: full rate, never quiet.
+  - The 2027 struct needs a typed subscriber. A NetworkTables table listener subscribes with no
+    type, and an untyped subscription to a `struct:` topic is disabled (type mismatch), so it never
+    fires. `NTDriverStationTest` (in the fork) covers both formats.
+  - `tests/fake-robot/FakeRobot.java` publishes the 2027 struct by default; set
+    `FAKE_ROBOT_WPILIB=2026` for the roboRIO format.
 - **Deadlines:** the script re-runs itself under `timeout` (the phases plus 60 s), so cleanup still
   runs on a timeout; `FakeRobot` gives up after 30 s without a connection. `tegrastats` is stopped
   with `tegrastats --stop`: killing its `sudo` left it running and holding the script's output

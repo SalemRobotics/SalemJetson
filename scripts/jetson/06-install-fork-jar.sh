@@ -3,6 +3,8 @@
 # 03-photonvision.sh, and run it explicitly on Java 17, matching the 2026 build.
 # Run ON THE JETSON. Usage: 06-install-fork-jar.sh <path/to/photonvision-...-linuxarm64.jar>
 set -euo pipefail
+# Writes on the read-only system (ro-root on) land in RAM and vanish at the next boot.
+[[ $(findmnt -n -o FSTYPE /) != overlay ]] || { echo "The system partition is read-only (ro-root on): scripts/jetson/ro-root.sh off first." >&2; exit 1; }
 
 JAR=${1:?usage: $0 <photonvision-linuxarm64.jar>}
 JAVA17=/usr/lib/jvm/java-17-openjdk-arm64/bin/java
@@ -29,7 +31,12 @@ fi
 if [[ -f $DEST ]] && unzip -tq "$DEST" >/dev/null 2>&1; then
   sudo cp "$DEST" /opt/photonvision/photonvision.jar.prev
 fi
-sudo install -m 644 "$JAR" "$DEST"
+# Copied beside it and renamed over it, with syncs: a power cut mid-install (a pit update, then the
+# robot switched off) leaves the old jar or the new one, never a truncated one that crash-loops.
+sudo install -m 644 "$JAR" "$DEST.new"
+sync
+sudo mv -f "$DEST.new" "$DEST"
+sync
 
 # Drop-in override instead of editing the installer's unit.
 # PhotonVision manages networking (static IP, hostname) from its UI unless

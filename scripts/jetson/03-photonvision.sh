@@ -5,6 +5,8 @@
 # Use stable 2026 PhotonLib in the robot code.
 # Usage: scripts/jetson/03-photonvision.sh [version]
 set -euo pipefail
+# Writes on the read-only system (ro-root on) land in RAM and vanish at the next boot.
+[[ $(findmnt -n -o FSTYPE /) != overlay ]] || { echo "The system partition is read-only (ro-root on): scripts/jetson/ro-root.sh off first." >&2; exit 1; }
 
 PV_VERSION=${1:-v2026.3.4}
 # Last installer revision before the Java 25 / 2027 transition.

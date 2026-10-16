@@ -116,6 +116,7 @@ Site.chapter('failsafes', (root) => {
         ['detect', ['pv', 'kern', 'hub'], '+8 s', 'Still nothing 5 s later: a USB-level reset, like unplugging and replugging it in software.'],
         ['recover', ['camB', 'kern'], '+9.1 s', 'The kernel re-finds the camera and re-applies its USB bandwidth cap. cscore reconnects.'],
         ['recover', ['pv', 'robot'], '', '"delivering frames again, after a USB reset." The health/recoveries topic counts it.'],
+        ['info', ['pv'], '', 'The watchdog only counts time spent reading. A pause of over 2 s between reads (robot code re-enabling a camera) used to count as no frames, and reconnected a healthy camera: a 0.5–1 s blackout for nothing. Now such a pause restarts its clock (photonvision-66).', 'A pause in reading (robot code re-enabling a camera) no longer counts as a stuck camera (photonvision-66).'],
       ] },
     { id: 'cuda', icon: '⚡', name: 'One CUDA error', time: 'one frame', secs: 0.0083, m: 1,
       src: 'bos-01 + detector/, fault injection with /tmp/spectrum-971-fault-every',
@@ -135,13 +136,14 @@ Site.chapter('failsafes', (root) => {
         ['recover', ['gpu', 'robot'], '+8 s', 'Detecting again 6.2 s after the exit: about 8 s in total. Before our fixes: about 62 s.', 'Detecting again 6.2 s after the exit: about 8 s in total.'],
       ] },
     { id: 'crash', icon: '💥', name: 'PhotonVision crashes', time: 'seconds', cl: '≈ 6 s', secs: 6.2, m: 0,
-      src: 'Restart=always and StartLimitIntervalSec=0 (09-robot-tuning.sh); JVM core dumps off (06-install-fork-jar.sh)',
+      src: 'Restart=always, StartLimitIntervalSec=0 and TimeoutStopSec=15 (09-robot-tuning.sh); JVM core dumps off (06-install-fork-jar.sh)',
       steps: [
         ['fault', ['pv'], '', 'The Java program dies, for any reason.'],
         ['detect', ['sysd'], 'at once', 'systemd sees its service exit.'],
         ['recover', ['sysd', 'pv'], '', 'Restart=always restarts it, with no limit on how many times (StartLimitIntervalSec=0). Java core dumps are off, so a native crash doesn\'t stall writing a huge file first.'],
         ['recover', ['gpu', 'robot'], '≈ 6 s', 'Back to detecting in about 6 s: the restart time we measured after the GPU fault exit.'],
         ['info', ['ssd'], '', 'If the program file itself is broken, the install script\'s saved photonvision.jar.prev gets it running again.'],
+        ['info', ['sysd'], '', 'Twice on Oct 1 a stop hung on the way out, after PhotonVision had finished shutting down. systemd waited 90 s before killing it. Now it waits 15 s (TimeoutStopSec=15).', 'A stop that hangs is killed after 15 s, not 90.'],
       ] },
     { id: 'hang', icon: '🧊', name: 'Linux freezes', time: '≈ 50 s', secs: 50, m: 0,
       src: 'zz-spectrum-watchdog.conf (RuntimeWatchdogSec=30s), kernel.panic=3; boot time measured after reboot',
@@ -153,13 +155,15 @@ Site.chapter('failsafes', (root) => {
         ['recover', ['gpu', 'robot'], '≈ +20 s', 'Detecting about 20 s after the reset. Total ≈ 50 s: added up from measured parts, not timed end to end.'],
       ] },
     { id: 'power', icon: '🔋', name: 'Power cut mid-recording', time: '~20 s after power returns', secs: 20, m: 1,
-      src: 'tests/power-cut/run.sh, power pulled 21.4 s into a recording',
+      src: 'tests/power-cut/run.sh, power pulled 21.4 s into a recording; the SSD that died on 2026-09-30 (README "Storage and power cuts")',
       steps: [
         ['fault', ['pwr', 'ssd'], '', 'Power is pulled while Rewind is recording to the SSD.'],
         ['info', ['ssd'], '', 'Already done ahead of time: data reaches the SSD within ~3 s, Rewind syncs every 2 s, the log is kept on the SSD.'],
         ['detect', ['kern', 'ssd'], 'next boot', 'ext4 replays its journal: "recovery complete". 0 filesystem errors.'],
         ['recover', ['sysd', 'pv', 'gpu', 'robot'], '~20 s', 'PhotonVision back, both calibrations loaded, detecting ~20 s after power returns.'],
         ['info', ['ssd'], '', 'The recording kept 20.0 of 21.4 s: 1.4 s lost, every saved frame complete. The log survived up to 3 s before the cut.'],
+        ['fault', ['ssd'], 'after 21 cuts', 'But the test only checked that the Jetson booted again. After 21 cuts, our first SSD (a DRAM-less budget drive) had 285 media errors and stopped booting.'],
+        ['recover', ['ssd', 'pv'], '', 'Now the SSD is split: the system part isn\'t written during a match, settings have a fallback copy, and quiet mode stops all writing after a match. health-check.sh reads the drive\'s own media errors.', 'Now the SSD is split, and the Jetson stops writing to it after a match.'],
       ] },
     { id: 'xhci', icon: '🧯', name: 'USB controller dies', time: '~2 s reset', secs: 2, m: 1,
       src: '14-usb-watchdog.sh, tested with a faked "HC died" kernel line',
@@ -180,13 +184,15 @@ Site.chapter('failsafes', (root) => {
         ['recover', ['pwr', 'camA', 'camB'], 'pit', 'Only cutting the camera\'s power works: replug it, or power-cycle the robot between matches.'],
       ] },
     { id: 'heat', icon: '🌡️', name: 'Overheating', time: 'no outage', secs: 0, m: 1,
-      src: 'Fan and fanless tests (TECHNICAL.md "Match readiness", "Fanless")',
+      src: 'Fan and fanless tests (TECHNICAL.md "Match readiness", "Fanless"; README "Fanless (heatsink plate)", photonvision-57, photonvision-71)',
       steps: [
-        ['info', ['fan'], '', 'The fan runs at full speed from boot: the hottest sensor went from 56 to 43 °C on the bench.', 'The fan runs at full speed from boot (about 43 °C on the bench).'],
+        ['info', ['fan'], '', 'A Jetson with the stock fan, on Cooling: Fan (NVIDIA\'s quiet profile): 775 rpm, about 43 °C on the bench.', 'A stock fan on NVIDIA\'s quiet profile: about 43 °C on the bench.'],
         ['fault', ['fan'], '', 'Suppose the fan dies.'],
-        ['detect', ['fan', 'robot'], '', 'health-check.sh reads the fan\'s speed sensor and FAILs under 1,000 rpm. Temperatures are on NetworkTables.'],
+        ['detect', ['fan', 'robot'], '', 'health-check.sh reads the fan\'s speed sensor and FAILs under 1,000 rpm while the fan is told to spin hard. Temperatures are on NetworkTables.'],
         ['info', ['gpu'], 'minutes', 'Fan off at full power: 42 → 85 °C in about 10 minutes. The chip only starts throttling at 99 °C and shuts down at 104.5 °C.'],
         ['recover', ['robot'], '', 'A dead fan isn\'t fatal in a match: the Jetson slowly climbs toward its throttle point. The throttle topic would say HIGH TEMP.'],
+        ['info', ['fan', 'pv'], '95 °C', 'Running fanless on purpose (Cooling: No fan, like ours)? At 95 °C the Jetson caps every camera at 60 fps until it\'s under 88 °C, before the chip would throttle at 99 °C.'],
+        ['info', ['fan', 'robot'], '', 'A fresh install is fanless. A stock fan left on No fan never spins, and the cameras get capped: likely why another team saw 80 fps. Match Ready points at Cooling when the chip is hot or fanless.', 'A stock fan left on No fan never spins. Match Ready points at Cooling.'],
       ] },
     { id: 'sag', icon: '📉', name: 'Battery sag / brownout', time: 'no outage if power stays', secs: 0, m: 1,
       src: 'Power board test 2026-09-25; photonvision-20 throttle reason',
@@ -221,7 +227,7 @@ Site.chapter('failsafes', (root) => {
       camA: ['TopLeft cam', 'USB 2.1'], camB: ['TopRight cam', 'USB 2.3'], pwr: ['Power', '15 V boost'],
       hub: ['USB hub', 'inside the Jetson'], xhci: ['USB controller', 'one USB 2.0 bus'], kern: ['Linux kernel', 'uvcvideo driver'],
       pv: ['PhotonVision', 'Java program'], gpu: ['CUDA detector', 'on the GPU'], sysd: ['systemd', 'restarts services'],
-      robot: ['Robot', 'NetworkTables'], wd: ['HW watchdog', '30 s timer'], ssd: ['SSD', 'ext4 + journal'], fan: ['Fan', 'full speed'],
+      robot: ['Robot', 'NetworkTables'], wd: ['HW watchdog', '30 s timer'], ssd: ['SSD', 'split in 3 parts'], fan: ['Fan', 'Cooling setting'],
     };
     const links = [['camA', 'hub'], ['camB', 'hub'], ['hub', 'xhci'], ['xhci', 'kern'], ['kern', 'pv'], ['pv', 'gpu'], ['pv', 'robot'], ['sysd', 'pv'], ['wd', 'sysd'], ['pv', 'ssd'], ['pwr', 'hub'], ['fan', 'gpu']];
     const WIDE = { vb: [860, 400], bw: 170, bh: 54, pos: { camA: [20, 30], camB: [20, 120], pwr: [20, 310], hub: [230, 75], xhci: [230, 170], kern: [230, 265], pv: [450, 120], gpu: [450, 215], sysd: [450, 310], robot: [670, 30], wd: [670, 310], ssd: [670, 120], fan: [670, 215] } };
@@ -335,7 +341,7 @@ Site.chapter('failsafes', (root) => {
       'not connected to the robot': 'expected: this ran on the bench, not on the robot',
       'Wi-Fi is connected': 'on the to-do list: Wi-Fi goes off before competition',
       'fan: NVIDIA fan control': 'the fan was on NVIDIA\'s quiet profile for this capture; the check confirms it really spins',
-      'filesystem: no ext4 errors': 'no damage from power cuts',
+      'filesystem: no ext4 errors': 'no filesystem damage. That alone missed our dying SSD, so health-check.sh now also reads the drive\'s own media errors',
       'boot time: 16.517s': 'matches systemd-analyze: 16.5 s',
     };
     const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -370,7 +376,7 @@ Site.chapter('failsafes', (root) => {
     dash.innerHTML = tiles.map(([k]) => `<div class="tile" data-k="${k}"><small>${k}</small><b>–</b>${k === 'gpuLoadPct' || k === 'tjTempC' ? '<canvas></canvas>' : ''}</div>`).join('');
     const el = (k) => dash.querySelector(`[data-k="${k}"]`);
     const spark = { gpuLoadPct: [], tjTempC: [] };
-    const S = { gpu: 12, temp: 43, fan: 5586, pw: 9.1, oc: 0, hb: 48200, sagT: 99, fanDead: false, deadT: 0 };
+    const S = { gpu: 12, temp: 43, fan: 775, pw: 9.1, oc: 0, hb: 48200, sagT: 99, fanDead: false, deadT: 0 };
     const fanB = $('#f-fan'), sagB = $('#f-sag');
     let acc = 1;
     const now = () => (acc = 1); // redraw on the next frame, so every click shows at once
@@ -387,13 +393,13 @@ Site.chapter('failsafes', (root) => {
         S.deadT += step * 60; // 60x: seconds of sim per second
         S.fan = 0;
         S.temp = 99 - (99 - 43) * Math.exp(-S.deadT / 396); // our RC model: ~6.6 min time constant, 99 C steady state at full power
-      } else { S.fan = 5586 + (Math.random() - 0.5) * 60; S.temp = 43 + (Math.random() - 0.5) * 0.6; }
+      } else { S.fan = 775 + (Math.random() - 0.5) * 20; S.temp = 43 + (Math.random() - 0.5) * 0.6; }
       S.pw = 9.1 + (Math.random() - 0.5) * 0.8 + (S.sagT < 2 ? -0.6 : 0);
       const thr = S.temp >= 98.5 ? 'HIGH TEMP (cpu, gpu)' : S.sagT < 10 ? 'OVER-CURRENT' : S.oc ? `Prev. over-current (${S.oc})` : 'None';
       const set = (k, v, cls) => { const e = el(k); e.querySelector('b').textContent = v; e.classList.toggle('warn', cls === 'warn'); e.classList.toggle('bad', cls === 'bad'); };
       set('gpuLoadPct', S.gpu.toFixed(0) + ' %');
       set('tjTempC', S.temp.toFixed(1) + ' °C', S.temp > 85 ? 'bad' : S.temp > 70 ? 'warn' : '');
-      set('fanRpm', Math.round(S.fan).toLocaleString(), S.fan < 1000 ? 'bad' : '');
+      set('fanRpm', Math.round(S.fan).toLocaleString(), S.fan < 100 ? 'bad' : ''); // the quiet profile idles at 775 rpm, so only a stopped fan is bad
       set('powerW', S.pw.toFixed(1) + ' W');
       set('jpegDecoder', 'nvjpg');
       set('throttle', thr, thr === 'None' ? '' : thr.startsWith('Prev') ? 'warn' : 'bad');

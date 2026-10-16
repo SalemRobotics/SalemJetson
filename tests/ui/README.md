@@ -12,6 +12,8 @@ tests/ui/run.sh
 - **Takes** a few minutes. Prints one line per control, with the backend setting each one moved.
 - **Needs** the Jetson on the USB link or Wi-Fi (`run.sh` opens the SSH tunnel), and a
   PhotonVision built with `photonvision-45` or later.
+- **No cameras? Use fake ones.** On the Jetson, `scripts/jetson/fake-cameras.sh start` plays a Rewind recording (by default a generated session with AprilTags) into virtual cameras and runs PhotonVision on throwaway settings, so nothing you set up is touched; then run the suite as usual from the laptop, and `fake-cameras.sh stop` afterwards. All 12 tests passed on two fake cameras on 2026-10-01 (after the audit fixes), including the two that skip on the real cameras while one is unplugged; tests of camera controls and USB bandwidth see no such controls and pass or skip accordingly.
+- **Runs on the cameras that are streaming.** Setup measures each camera's frame rate (`framesProcessed`, `photonvision-58`; streaming means more than 15 fps, since a camera that's gone still yields ~10 empty results a second). Tests run on those. The ones that change every camera (Create on every camera with Switch all, and the event pipeline) skip if any camera isn't streaming: PhotonVision changes an unplugged camera's saved setup too, and nothing can put it back until it's plugged in. Teardown checks that unplugged cameras' saved pipelines are untouched, and Match Ready must say NOT READY and name them.
 - **Touches nothing you set up.** Each test copies the camera's current pipeline to a temporary
   `zz-uitest`, works on that, deletes it, and switches back. A run that was killed half way leaves
   `zz-uitest` behind; the next run deletes it first. Nothing is reset.
@@ -21,7 +23,7 @@ tests/ui/run.sh
 
 | Setting | Default | |
 |---|---|---|
-| `PV_UI_CAMERA` | TopLeft, or the first camera | camera to test on |
+| `PV_UI_CAMERA` | TopLeft, or the first streaming camera | camera to test on |
 | `PV_UI_HEADED=1` | off | show the browser |
 | `PV_UI_TEST_VIDEO_MODES=1` | off | also switch resolutions (it reopens the camera) |
 | `PV_URL` | `http://localhost:5800` | another PhotonVision |
@@ -64,9 +66,13 @@ tests/ui/run.sh
 - **`far-search`:** Settings > Robot state's far-tag search: its status, and no full-size searches
   while it's switched off.
 
-**Limits:** 10 s per click, 2 min per test, 8 min per run; `run.sh` stops anything past 10 min. The
-run fails if a camera ends on a different pipeline than it started on, or a `zz-uitest` pipeline is
-left behind (or a `zz-uitest` snapshot), and says which.
+**Limits:** 10 s per click, 2 min per test (6 for the round trip, ~2.6 min over the Jetson's
+Wi-Fi), 8 min per run; `run.sh` stops anything past 10 min. A test's clean-up starts from a fresh
+page, so a test that died half way can't leave a menu open in its way. The run fails if a camera
+ends on a different pipeline than it started on, or a `zz-uitest` pipeline is left behind (or a
+`zz-uitest` snapshot), and says which. Quiet mode that the fake robot's disabled phases started
+(the scratch partition read-only, and it stays so with the robot gone) is ended with a 2 s fake
+enable; the run fails only if that doesn't work.
 
 ## Writing a test
 

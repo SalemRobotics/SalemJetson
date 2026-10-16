@@ -7,8 +7,8 @@
 //    decision margin of at least kGoodMargin (near tags: a solid multi-tag pose).
 //  - When no camera has had a good view for kStarveMs, the cameras are *starved*: one camera at a
 //    time (round robin, at most sweeps_per_s across all of them) runs a full-size search of its
-//    frame (a 2x nearest-neighbour upscale through a shared 2560x1600 detector; the half-size
-//    search then sees every pixel). Tags it finds that the normal search didn't are tracked with
+//    frame (a 2x nearest-neighbour upscale through a shared detector, in tiles of at most 1024
+//    frame px a side, the 971 detector's limit; the half-size search then sees every pixel). Tags it finds that the normal search didn't are tracked with
 //    full-size crops (160x160 upscaled to 320x320, one detector per camera) on that camera's
 //    following frames.
 //  - As soon as any camera has a good view again, all of it stops: cameras cost what they did.
@@ -53,6 +53,13 @@ struct Config {
 void SetConfig(const Config &c);
 Config GetConfig();
 
+// Tags that don't count toward a good view: PhotonVision's excluded tags (photonvision-22). They're
+// left out of the multi-tag solve, so seeing them doesn't give the robot the solid pose a good view
+// stands for. Before, two excluded tags in view turned the far search off. Set from Java
+// (GpuDetectorJNI.setFarSearchExcluded, photonvision-69); kept apart from Config so the two
+// setters can't overwrite each other's values.
+void SetExcluded(const std::vector<int> &ids);
+
 // Counters since start, for the stats line and /api/farSearch.
 struct Counters {
   long sweeps = 0;       // full-size searches run
@@ -87,6 +94,6 @@ constexpr int kGoodTags = 2;
 constexpr double kGoodSidePx = 40;
 constexpr float kGoodMargin = 30;
 constexpr int64_t kStarveUs = 250'000;
-bool GoodView(const std::vector<Det> &dets);
+bool GoodView(const std::vector<Det> &dets, const std::vector<int> &excluded = {});
 
 }  // namespace far_search
