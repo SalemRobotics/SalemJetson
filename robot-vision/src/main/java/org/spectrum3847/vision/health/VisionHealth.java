@@ -2,6 +2,7 @@ package org.spectrum3847.vision.health;
 
 import edu.wpi.first.networktables.BooleanSubscriber;
 import edu.wpi.first.networktables.DoubleSubscriber;
+import edu.wpi.first.networktables.IntegerSubscriber;
 import edu.wpi.first.networktables.NetworkTable;
 import edu.wpi.first.networktables.NetworkTableInstance;
 import edu.wpi.first.networktables.StringSubscriber;
@@ -24,9 +25,27 @@ import org.spectrum3847.vision.log.VisionStats;
  *   <li>the coprocessor's time sync is stale (frames' {@code timeSinceLastPong})
  *   <li>a camera's fps is below {@link #minFps} while enabled (SpectrumJetson's {@code health/fps})
  *   <li>a camera reports a problem (SpectrumJetson's {@code health/problem}: stuck, wrong mode, ...)
+ *   <li>the Jetson has given up on a camera (SpectrumJetson's {@code health/state} "gave-up": only
+ *       a power cycle brings a wedged Thriftiest Cam back)
  *   <li>the Jetson is throttling (over-current or temperature) or hot ({@link #maxJetsonTempC})
  *   <li>the Jetson is in quiet mode while the robot is enabled (it shouldn't be)
  *   <li>frames arrive but every candidate is rejected (with the top reason), while enabled
+ * </ul>
+ *
+ * With SpectrumJetson's photonvision-82 diagnostics, also (each stays up until robot code restarts,
+ * so the pit sees it after the match):
+ *
+ * <ul>
+ *   <li>the Jetson's input voltage dipped below {@link #minJetsonInputV}
+ *   <li>USB trouble on the Jetson (a camera dropped off USB, a hub disabled a port, ...), with the
+ *       kernel's latest line
+ *   <li>the Jetson's Ethernet link dropped (its cable or the switch, not the NT server)
+ *   <li>the Jetson rebooted
+ *   <li>the Jetson's clock was never set from the robot (its logs and Rewind names carry a wrong
+ *       date): robot code should publish {@code /photonvision/clock/unixMs}
+ *   <li>the SSD reports media errors or a critical warning; ext4 recorded errors; the settings
+ *       partition went read-only
+ *   <li>RAM above {@link #maxJetsonRamPct}
  * </ul>
  */
 public class VisionHealth {
@@ -34,6 +53,13 @@ public class VisionHealth {
     public double maxJetsonTempC = 92;
     public double startupGraceSeconds = 10;
     public double allRejectedAfterSeconds = 3;
+    /**
+     * The Jetson module's 5 V input (VDD_IN, after the carrier board's regulator: about 4.95 V; the
+     * 12 V supply itself isn't measured). Below 4.75 V (5 V -5%) the regulator is dropping out:
+     * a sagging battery or bad wiring to the carrier.
+     */
+    public double minJetsonInputV = 4.75;
+    public double maxJetsonRamPct = 90;
 
     private final NetworkTable pv = NetworkTableInstance.getDefault().getTable("photonvision");
     private final Map<String, CameraAlerts> cameras = new LinkedHashMap<>();
@@ -49,10 +75,38 @@ public class VisionHealth {
     private final double startedSeconds;
     private double rejectingSince = Double.NaN;
 
+    // SpectrumJetson photonvision-82: the Jetson's diagnostics.
+    private final NetworkTable jetson = pv.getSubTable("jetson");
+    private final DoubleSubscriber inputLowest = jetson.getDoubleTopic("inputVoltageLowestV").subscribe(Double.NaN);
+    private final IntegerSubscriber usbEvents = jetson.getIntegerTopic("usbEvents").subscribe(-1);
+    private final StringSubscriber lastUsbEvent = jetson.getStringTopic("lastUsbEvent").subscribe("");
+    private final IntegerSubscriber carrierChanges = jetson.getIntegerTopic("ethCarrierChanges").subscribe(-1);
+    private final StringSubscriber bootId = jetson.getStringTopic("bootId").subscribe("");
+    private final StringSubscriber clockSource = jetson.getStringTopic("clockSource").subscribe("");
+    private final IntegerSubscriber ssdMediaErrors = jetson.getIntegerTopic("ssdMediaErrors").subscribe(0);
+    private final IntegerSubscriber ssdCriticalWarning = jetson.getIntegerTopic("ssdCriticalWarning").subscribe(0);
+    private final IntegerSubscriber fsErrors = jetson.getIntegerTopic("fsErrors").subscribe(0);
+    private final BooleanSubscriber settingsReadOnly = jetson.getBooleanTopic("settingsReadOnly").subscribe(false);
+    private final DoubleSubscriber ramUsed = jetson.getDoubleTopic("ramUsedPct").subscribe(Double.NaN);
+    private final VisionAlert lowInputAlert = new VisionAlert("Vision", "", Level.ERROR);
+    private final VisionAlert usbAlert = new VisionAlert("Vision", "", Level.ERROR);
+    private final VisionAlert ethernetAlert = new VisionAlert("Vision", "", Level.WARNING);
+    private final VisionAlert rebootAlert = new VisionAlert("Vision", "Jetson rebooted (power?)", Level.WARNING);
+    private final VisionAlert clockAlert =
+            new VisionAlert(
+                    "Vision",
+                    "Jetson clock not set from the robot: publish /photonvision/clock/unixMs (its logs carry a wrong date)",
+                    Level.WARNING);
+    private final VisionAlert ssdAlert = new VisionAlert("Vision", "", Level.ERROR);
+    private final VisionAlert ramAlert = new VisionAlert("Vision", "", Level.WARNING);
+    // Counters as first seen after robot code started: a rise is trouble this run.
+    private long usbEventsAtStart = -1, carrierChangesAtStart = -1;
+    private String firstBootId = null;
+
     private static final class CameraAlerts {
-        final VisionAlert disconnected, format, sync, fps, problem;
+        final VisionAlert disconnected, format, sync, fps, problem, gaveUp;
         final DoubleSubscriber fpsSub;
-        final StringSubscriber problemSub;
+        final StringSubscriber problemSub, stateSub;
         final String name;
 
         CameraAlerts(NetworkTable pv, String name) {
@@ -62,9 +116,23 @@ public class VisionHealth {
             sync = new VisionAlert("Vision", "Camera " + name + ": time sync stale (timestamps may be wrong)", Level.WARNING);
             fps = new VisionAlert("Vision", "", Level.WARNING);
             problem = new VisionAlert("Vision", "", Level.ERROR);
-            fpsSub = pv.getSubTable(name).getSubTable("health").getDoubleTopic("fps").subscribe(Double.NaN);
-            problemSub = pv.getSubTable(name).getSubTable("health").getStringTopic("problem").subscribe("");
+            gaveUp = new VisionAlert(
+                    "Vision", "Camera " + name + " won't recover by itself: power-cycle the robot", Level.ERROR);
+            var health = pv.getSubTable(name).getSubTable("health");
+            fpsSub = health.getDoubleTopic("fps").subscribe(Double.NaN);
+            problemSub = health.getStringTopic("problem").subscribe("");
+            stateSub = health.getStringTopic("state").subscribe("");
         }
+    }
+
+    /**
+     * SpectrumJetson's {@code health/state} for a camera: "streaming", "stalled", "recovering",
+     * "disconnected", "gave-up", "paused" or "starting"; "" when the coprocessor doesn't publish it
+     * (stock PhotonVision, or before SpectrumJetson's photonvision-81). Log it with the camera.
+     */
+    public String cameraState(String name) {
+        var c = cameras.get(name);
+        return c == null ? "" : c.stateSub.get();
     }
 
     public VisionHealth(double nowSeconds) {
@@ -94,6 +162,9 @@ public class VisionHealth {
             String p = c.problemSub.get();
             c.problem.setText("Camera " + name + ": " + p);
             c.problem.set(p != null && !p.isEmpty());
+            // The Jetson has given up on it (a wedged camera needs its power cut). Its problem says
+            // why; this says what to do, and covers a Jetson that hasn't filled in a problem.
+            c.gaveUp.set("gave-up".equals(c.stateSub.get()) && (p == null || p.isEmpty()));
         });
         String t = throttle.get();
         throttleAlert.setText("Jetson throttling: " + t);
@@ -104,6 +175,7 @@ public class VisionHealth {
         hotAlert.setText(String.format("Jetson at %.0f °C (cameras capped from 95 °C)", temp));
         hotAlert.set(!Double.isNaN(temp) && temp >= maxJetsonTempC);
         quietAlert.set(enabled && quietNow.get());
+        updateDiagnostics(pastGrace);
         // Frames arriving but nothing accepted, for a while: say why.
         if (enabled && loopCounts.candidates > 0 && loopCounts.accepted == 0) {
             if (Double.isNaN(rejectingSince)) rejectingSince = now;
@@ -113,5 +185,48 @@ public class VisionHealth {
         boolean stuck = !Double.isNaN(rejectingSince) && now - rejectingSince > allRejectedAfterSeconds;
         allRejected.setText("Vision rejecting every pose (most: " + topReason + ")");
         allRejected.set(stuck);
+    }
+
+    /** photonvision-82's diagnostics. Each alert stays up until robot code restarts. */
+    private void updateDiagnostics(boolean pastGrace) {
+        double lowest = inputLowest.get();
+        if (!Double.isNaN(lowest) && lowest < minJetsonInputV) {
+            lowInputAlert.setText(String.format("Jetson 5 V input dipped to %.2f V (power supply or wiring)", lowest));
+            lowInputAlert.set(true);
+        }
+        long usb = usbEvents.get();
+        if (usb >= 0 && usbEventsAtStart < 0) usbEventsAtStart = usb;
+        if (usbEventsAtStart >= 0 && usb > usbEventsAtStart) {
+            usbAlert.setText("Jetson USB trouble (" + (usb - usbEventsAtStart) + "): " + lastUsbEvent.get());
+            usbAlert.set(true);
+        }
+        long carrier = carrierChanges.get();
+        if (carrier >= 0 && carrierChangesAtStart < 0) carrierChangesAtStart = carrier;
+        if (carrierChangesAtStart >= 0 && carrier > carrierChangesAtStart) {
+            ethernetAlert.setText(
+                    "Jetson Ethernet link dropped " + (carrier - carrierChangesAtStart) / 2
+                            + " time(s): its cable or the switch port");
+            ethernetAlert.set(carrier - carrierChangesAtStart >= 2);
+        }
+        String boot = bootId.get();
+        if (!boot.isEmpty()) {
+            if (firstBootId == null) firstBootId = boot;
+            else if (!boot.equals(firstBootId)) rebootAlert.set(true);
+        }
+        clockAlert.set(pastGrace && "unset".equals(clockSource.get()));
+        long media = ssdMediaErrors.get(), critical = ssdCriticalWarning.get(), fs = fsErrors.get();
+        boolean settingsRo = settingsReadOnly.get();
+        if (media > 0 || critical != 0 || fs > 0 || settingsRo) {
+            ssdAlert.setText(
+                    "Jetson SSD: "
+                            + (media > 0 ? media + " media errors (replace it) " : "")
+                            + (critical != 0 ? "critical warning " + critical + " " : "")
+                            + (fs > 0 ? fs + " filesystem errors " : "")
+                            + (settingsRo ? "settings partition read-only" : ""));
+            ssdAlert.set(true);
+        }
+        double ram = ramUsed.get();
+        ramAlert.setText(String.format("Jetson RAM at %.0f%%", ram));
+        ramAlert.set(!Double.isNaN(ram) && ram > maxJetsonRamPct);
     }
 }

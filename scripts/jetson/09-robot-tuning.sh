@@ -47,6 +47,8 @@
 #                               (spectrum-wifi-retry.sh). After an access point rejected the Jetson
 #                               twice, NetworkManager gave up for the whole boot (2 h 20 min,
 #                               2026-10-01). Nothing happens with the radio switched off (events).
+#  13. SSD health readable    - smartmontools (smartctl) for photonvision-82's SSD topics
+#  14. Camera flashing        - pyusb (python3-usb) for photonvision-87's firmware card
 #
 # Usage: [FAN=quiet|full|off] 09-robot-tuning.sh [--undo]   (no FAN: keep the saved choice)
 set -euo pipefail
@@ -340,6 +342,25 @@ WantedBy=timers.target
 UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now spectrum-wifi-retry.timer
+
+echo "==> 13. SSD health readable (smartctl)"
+# photonvision-82 reads the SSD's error counts, wear and unsafe shutdowns with smartctl every 5 min
+# and sends them to the robot; health-check.sh uses it too. smartd (its background monitor) stays
+# off: nothing here reads its mail, and PhotonVision does the checking.
+if command -v smartctl >/dev/null || sudo apt-get install -y smartmontools >/dev/null; then
+  sudo systemctl disable --now smartmontools.service smartd.service 2>/dev/null || true
+else
+  echo "  WARNING: couldn't install smartmontools (no internet?): SSD health won't be reported"
+fi
+
+echo "==> 14. Thriftiest Cam flashing from PhotonVision (pyusb)"
+# photonvision-87's Settings > Thriftiest Cam firmware card flashes cameras with thriftiest-fw.py,
+# which needs pyusb. (The laptop's scripts/host/thriftiest-flash.sh brings its own copy.)
+if python3 -c "import usb" 2>/dev/null || sudo apt-get install -y python3-usb >/dev/null; then
+  echo "  pyusb installed"
+else
+  echo "  WARNING: couldn't install python3-usb (no internet?): flashing from PhotonVision needs scripts/host/thriftiest-flash.sh run once"
+fi
 
 echo
 echo "Summary:"

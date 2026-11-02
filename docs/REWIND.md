@@ -34,14 +34,32 @@ All topics are under `/photonvision/rewind/` in NetworkTables.
 | Topic | Type | Who sets it | Meaning |
 |---|---|---|---|
 | `record` | boolean | robot | Record while true. |
-| `label` | string | robot | Optional name for the recording, e.g. `shooter-test-3`. Empty: the FMS match (`Q12`), else `robot`. Read when a recording starts. |
+| `label` | string | robot | Optional name for the recording, e.g. `shooter-test-3`. Empty: the FMS match (`Q12`), else the robot's mode (`auto`, `teleop`, `test`, `disabled`, `estop`, or `no-robot`). Read when a recording starts. |
 | `recording` | boolean | Jetson | Whether it's recording right now. |
 | `session` | string | Jetson | The current recording's name. |
 | `freeGB` | double | Jetson | Free space on the Jetson's SSD. |
 | `framesDropped` | integer | Jetson | Frames it couldn't save (bad JPEGs, write errors, a camera not in MJPEG mode). |
 
-If the robot disconnects while `record` is true (a brownout or reboot), the Jetson keeps recording
-for 60 s, so you get the video of whatever happened.
+If the robot disconnects while `record` is true (a brownout, a reboot, a bad cable), the Jetson
+keeps recording, so you get the video of whatever happened:
+- **An FMS match:** until the robot is back and sends `record` false, or 5 min after its last true
+  (`photonvision-78`). That covers the rest of a match the robot dropped out of.
+- **Anything else:** 60 s. Settings > Rewind > **Record through disconnects** gives every robot
+  recording the match rule. Turn it on at events for practice matches; leave it off on the bench.
+
+**A NetworkTables drop doesn't split a recording** (`photonvision-77`). After a reconnect, `record`
+reads false on the Jetson until the robot's value arrives again. At TXMAN1 (2026-10-17) a flaky
+robot switch dropped NetworkTables for ~2 s in Q30, Q32 and a playoff match, and each time the
+Jetson took that false for "robot stopped": the match's video came out in two recordings. Now the
+grace keeps going after the reconnect until the robot sends `record` again:
+- **true:** the same recording carries on (the log says "the robot still wants recording; same
+  session").
+- **false:** it stops, as "robot stopped".
+- **nothing before the grace runs out:** it stops, as "robot didn't send record after
+  reconnecting".
+
+Robot code that sets `record` every loop needs no change. `tests/rewind-sessions/reconnect.sh`
+drops a fake robot's traffic mid-match and checks for one recording.
 
 Example (Java, WPILib 2027). Keep it in the vision IO layer so AdvantageKit replay stays clean:
 
@@ -128,6 +146,14 @@ With no name it copies the newest recording; `--all` copies everything. Recordin
 
 On the robot network, set the address: `JETSON=10.85.15.15 scripts/host/rewind-pull.sh`.
 
+**For robotlog.spectrum3847.org:** `scripts/host/jetson-pull.sh` copies every recording,
+PhotonVision's logs and the system journal (one `journal/boot-<boot id>.json.gz` for every boot still in it, as JSON so each
+line keeps its boot and monotonic time) into `~/jetson-pull/<date>/`. Upload that folder with
+robotlog's `npm run import -- --team 8515 <folder>`. PhotonVision logs a `Clock mark:` line
+(`photonvision-80`) every 60 s and whenever the robot connects, disconnects or the time-sync offset
+moves: it pairs the kernel's monotonic clock, `jetson_us`, the wall clock and the robot's offset,
+so every journal line can be placed on the robot's clock even before the Jetson's date is set.
+
 ## Lining video up with the AdvantageKit log
 
 Every frame has two timestamps:
@@ -151,14 +177,29 @@ and set its offset so a known event lines up; the CSV gives the exact offset.
 
 ```
 sessions/0007_Q12_20261010-143502/
-  session.json            name, why it recorded, match, label, fps, per-camera frame counts,
-                          start/end times, and why it ended
-  TopLeft/0000.mjpeg      JPEG frames back to back (one file per 60 s)
-  TopLeft/0000.csv        frame,offset,size,width,height,jetson_us,robot_us
+  0007_Q12_20261010-143502_session.json         name, why it recorded, match, label, fps,
+                                                per-camera frame counts, start/end times, and
+                                                why it ended
+  TopLeft/0007_Q12_20261010-143502_TopLeft_0000.mjpeg   JPEG frames back to back (one file per 5 min)
+  TopLeft/0007_Q12_20261010-143502_TopLeft_0000.csv     frame,offset,size,width,height,jetson_us,robot_us
+  0007_Q12_20261010-143502_vision.wpilog        what PhotonVision sent the robot (below)
   TopRight/...
 ```
 
-The number at the start of each name counts up forever, so name order is age order.
+The number at the start of each name counts up forever, so name order is age order. Every file
+names its recording and camera (`photonvision-75`), so it means the same thing out of its folder:
+robotlog.spectrum3847.org stores files by name. Recordings from before then have `session.json`,
+`0000.mjpeg` and `0000.csv`; the tools here read both.
+
+**`<session>_vision.wpilog`** (`photonvision-79`) holds every result PhotonVision published while
+recording, as the robot would have received it, even through a disconnect: per camera
+`/<camera>/result` (PhotonVision's own message, the bytes PhotonLib reads) and
+`/<camera>/multiTagCameraPose` (a `Pose3d`), plus `/Jetson/ntConnected`, `/Jetson/robotOffsetUs`,
+`/Jetson/robotMode` and `/Jetson/match` when they change. Its timestamps are `jetson_us`, like the
+frame tables; add `robotOffsetUs` for the robot's clock. AdvantageScope opens it.
+
+The label is the robot's `label`, else the FMS match, else the robot's mode when the recording
+started. A recording from the web page's Record now button uses the same fallback.
 
 ## Checking it still works
 

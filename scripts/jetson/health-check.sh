@@ -6,6 +6,7 @@
 set -uo pipefail
 
 EXPECT=${1:-2}
+HERE=$(dirname "$(readlink -f "$0")")   # the repo's scripts/jetson (PhotonVision runs it via a link)
 fails=0 warns=0
 pass() { printf "  PASS  %s\n" "$*"; }
 warn() { printf "  WARN  %s\n" "$*"; warns=$((warns + 1)); }
@@ -161,32 +162,66 @@ for (cfg,) in db.execute("select config_json from cameras"):
     print(cfg)
 PY
 }
-# PhotonVision camera nickname bound to a USB port (it matches identical cameras by port).
-cam_name() {
-  camera_configs | python3 -c "
-import json, sys, re
-text = sys.stdin.read()
-for chunk in re.split(r'(?m)^\\{', text):
-    if 'usb-0:$1:1.0' in chunk:
-        m = re.search(r'\"nickname\" : \"([^\"]*)\"', chunk)
-        if m: print(m.group(1)); break
-" 2>/dev/null
+# Each PhotonVision camera: nickname, the USB port it's on now ("" if it isn't), and what it's
+# known by. PhotonVision matches identical cameras by their port; photonvision-86: a camera with a
+# serial of its own (thriftiest-flash.sh rename) by that serial, in any port, so its port is
+# looked up from its /dev/v4l/by-id link.
+CAMS=$(python3 - "$DB" <<'PY' 2>/dev/null
+import json, os, re, sqlite3, sys
+db = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True, timeout=2)
+for (cfg,) in db.execute("select config_json from cameras"):
+    c = json.loads(cfg)
+    info = c.get("matchedCameraInfo") or {}
+    info = info.get("PVUsbCameraInfo", info)
+    ident = info.get("uniquePath") or ""
+    port = ""
+    if "/by-id/" in ident:
+        if os.path.exists(ident):
+            dev = os.path.realpath("/sys/class/video4linux/%s/device" % os.path.basename(os.path.realpath(ident)))
+            port = os.path.basename(dev).split(":")[0].split("-", 1)[-1]  # 1-2.3:1.0 -> 2.3
+    else:
+        m = re.search(r"usb-0:([0-9.]+):1\.0", ident)
+        if not m:
+            continue
+        port = m.group(1) if os.path.exists(ident) else ""
+        ident = "port " + m.group(1)
+    print("%s\t%s\t%s" % (c.get("nickname", ""), port, ident))
+PY
+)
+cam_name() { awk -F'\t' -v p="$1" '$2 == p { print $1; exit }' <<<"$CAMS"; }
+# Every camera PhotonVision knows that isn't on USB now: the loop below only sees cameras that are
+# there, so an unplugged or stuck one used to pass unnoticed (2026-10-01: BottomLeft gone from
+# port 2.2, and Match Ready said nothing about it).
+while IFS=$'\t' read -r name port ident; do
+  [[ -n $name && -z $port ]] || continue
+  if [[ $ident == "port "* ]]; then
+    fail "$name isn't on USB (its ${ident} is empty): replug it, or power-cycle the robot if it's a stuck Thriftiest Cam"
+  else
+    fail "$name isn't on USB (${ident##*/} isn't there): replug it, or power-cycle the robot if it's a stuck Thriftiest Cam"
+  fi
+done <<<"$CAMS"
+# Which firmware each Thriftiest Cam runs (thriftiest-fw.py variant: read through the video driver,
+# while the cameras stream). Every variant reports 5.13; only the usbrecov ones come back from a
+# USB drop by themselves.
+FW_VARIANTS=$(python3 "$HERE/thriftiest-fw.py" variant --json 2>/dev/null)
+fw_variant() {  # PORT -> "yes|no<TAB>label", or nothing if unknown
+  python3 -c 'import json, sys
+for c in json.loads(sys.argv[1] or "[]"):
+    if c["port"] == sys.argv[2] and c.get("variant"):
+        print("%s\t%s" % ("yes" if c["recovers"] else "no", c["label"]))' "$FW_VARIANTS" "$1" 2>/dev/null
 }
-# Every camera PhotonVision knows (its settings name a USB port) that isn't on USB now: the loop
-# below only sees cameras that are there, so an unplugged or stuck one used to pass unnoticed
-# (2026-10-01: BottomLeft gone from port 2.2, and Match Ready said nothing about it).
-while IFS=$'\t' read -r name port; do
-  [[ -n $port ]] || continue
-  ls /dev/v4l/by-path/*usb-0:"$port":1.0-video-index0 >/dev/null 2>&1 \
-    || fail "$name isn't on USB (its port $port is empty): replug it, or power-cycle the robot if it's a stuck Thriftiest Cam"
-done < <(camera_configs | python3 -c "
-import sys, re
-text = sys.stdin.read()
-for chunk in re.split(r'(?m)^\{', text):
-    n = re.search(r'\"nickname\" : \"([^\"]*)\"', chunk)
-    p = re.search(r'usb-0:([0-9.]+):1\.0', chunk)
-    if n and p: print(n.group(1) + '\t' + p.group(1))
-" 2>/dev/null)
+# Frames actually arriving, per USB port (1-2.4 -> fps), from PhotonVision's USB bandwidth API. A
+# camera can sit in the right video mode and send nothing: the Swyft on 2026-10-30, stuck for an
+# hour while this check still said "streaming 1280x800 MJPG, as set". Two looks, as
+# tests/usb-port-glitch does: the first only primes the frame-rate numbers.
+CAM_FPS=$(timeout 8 python3 -c 'import json, time, urllib.request
+get = lambda: json.load(urllib.request.urlopen("http://localhost:5800/api/usb/bandwidth", timeout=3))
+get(); time.sleep(1.5)
+for c in get().get("cameras", []):
+    # streaming: PhotonVision has it open (false for a deactivated camera); fps blank if unmeasured
+    fps = c.get("fps")
+    print("%s\t%s\t%s" % (c["port"], "yes" if c.get("streaming") else "no", "" if fps is None else "%.2f" % fps))' 2>/dev/null || true)
+cam_fps() { awk -F'\t' -v p="$1" '$1 == p { print $2 "\t" $3; exit }' <<<"$CAM_FPS"; }
 cams=0
 for intf in /sys/bus/usb/drivers/uvcvideo/*:1.0; do
   [[ -e $intf ]] || continue
@@ -215,7 +250,33 @@ for intf in /sys/bus/usb/drivers/uvcvideo/*:1.0; do
     if [[ -z $actual ]]; then warn "$name: couldn't read its video format (v4l2-ctl; is the user in the video group?)"
     elif [[ -n $want && ${want% *} != "$actual" ]]; then
       fail "$name is streaming ${actual} ${pixfmt}, but PhotonVision set ${want% *}: the detector gets an upscaled image (restart PhotonVision)"
-    else pass "$name streaming ${actual} ${pixfmt}${want:+, as set}"; fi
+    else
+      IFS=$'\t' read -r open fps <<<"$(cam_fps "$port")"
+      if [[ $open != yes ]]; then
+        pass "$name set to ${actual} ${pixfmt}${want:+, as set} (PhotonVision isn't streaming it: deactivated?)"
+      elif [[ -z $fps ]]; then
+        warn "$name set to ${actual} ${pixfmt}${want:+, as set}, but its frame rate is unknown (PhotonVision's USB bandwidth API didn't say)"
+      elif awk -v f="$fps" 'BEGIN { exit !(f < 1) }'; then
+        fail "$name is set to ${actual} ${pixfmt} but sends no frames (${fps} fps): power-cycle the robot, or replug it"
+      else pass "$name streaming ${actual} ${pixfmt}${want:+, as set}, ${fps%.*} fps"; fi
+    fi
+  fi
+  # Thriftiest Cam (1bcf:28c5) firmware: which variant (above), else from its USB bcdDevice (0x0513 =
+  # 5.13) and whether it has a gain control (the factory 5.13 hasn't). docs/THRIFTIEST-CAM-FIRMWARE.md.
+  if [[ $(cat "$dev/idVendor" 2>/dev/null):$(cat "$dev/idProduct" 2>/dev/null) == 1bcf:28c5 ]]; then
+    rev=$(cat "$dev/bcdDevice" 2>/dev/null)
+    fw=$((16#${rev:0:2})).${rev:2:2}
+    gain=$( [[ -n $vdev ]] && v4l2-ctl -d "$vdev" -l 2>/dev/null | grep -qE '^ *gain ' && echo yes)
+    variant=$(fw_variant "$hubport")
+    if [[ $variant == yes$'\t'* ]]; then
+      pass "${name:-$hubport}: Thriftiest Cam firmware ${variant#*$'\t'}: recovers from a USB drop"
+    elif [[ $variant == no$'\t'* ]]; then
+      warn "${name:-$hubport}: Thriftiest Cam firmware ${variant#*$'\t'}: a USB drop leaves it down until replugged; flash usbrecov (PhotonVision Settings > Thriftiest Cam firmware)"
+    elif [[ $((16#${rev:-0})) -lt $((16#0513)) ]]; then
+      warn "${name:-$hubport}: Thriftiest Cam firmware $fw, 5.13 is out (scripts/host/thriftiest-flash.sh flash $hubport ...)"
+    elif [[ -z $gain ]]; then
+      warn "${name:-$hubport}: Thriftiest Cam firmware $fw factory build, no gain control (scripts/host/thriftiest-flash.sh flash $hubport ...)"
+    else pass "${name:-$hubport}: Thriftiest Cam firmware $fw, gain control present"; fi
   fi
 done
 if [[ $cams -lt $EXPECT ]]; then fail "$cams camera(s) found, expected $EXPECT"; fi
